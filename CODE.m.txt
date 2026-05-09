@@ -1,0 +1,317 @@
+clear; clc; close all;
+
+imgList = {
+    'cameraman.tif', ...
+    'peppers.png', ...
+    'coins.png', ...
+    'pout.tif', ...
+    'rice.png', ...
+    'saturn.png', ...
+    'trees.tif', ...
+    'liftingbody.png', ...
+    'moon.tif', ...
+    'eight.tif',
+    
+};
+
+
+sigma     = 10;     
+K_pde     = 150;   
+dt        = 0.04;   
+lambda    = 0.08;    
+gamma_e   = 0.01;  
+k_e       = 0.5;    
+
+n_pop     = 20;      
+fpa_iter  = 50;      
+fpa_p     = 0.8;    
+K_fit     = 8;       
+results = struct();
+
+for idx = 1:length(imgList)
+    fname = imgList{idx};
+    fprintf('\n================================================\n');
+    fprintf(' Processing: %s\n', fname);
+    fprintf('================================================\n');
+
+   
+    u0 = im2double(imread(fname));
+    if size(u0,3) == 3
+        u0 = rgb2gray(u0);
+    end
+    u0 = imresize(u0, [256 256]);
+
+  
+    rng(42);  
+    noisy = u0 + (sigma/255) * randn(size(u0));
+    noisy = max(0, min(1, noisy));
+
+    psnr_noisy = paper_psnr(noisy, u0);
+    fprintf(' Noisy PSNR = %.2f dB\n', psnr_noisy);
+
+   
+    fprintf(' Running FPA (n=%d, d=%d, p=%.1f)...\n', n_pop, fpa_iter, fpa_p);
+    v_opt = fpa_optimize(u0, noisy, lambda, gamma_e, k_e, dt, ...
+                         K_fit, n_pop, fpa_iter, fpa_p);
+    fprintf(' Optimal v = %.4f\n', v_opt);
+
+   
+    fprintf(' Running FPD PDE (%d iters)...\n', K_pde);
+    fpd = fpd_pde(noisy, u0, v_opt, K_pde, dt, lambda, gamma_e, k_e);
+
+    
+    fprintf(' Running ROF baseline...\n');
+    rof = rof_pde(noisy, u0, K_pde, dt, lambda);
+
+    fprintf(' Running LLT baseline...\n');
+    llt = llt_pde(noisy, u0, K_pde, dt, lambda);
+
+  
+    p_rof = paper_psnr(rof, u0);  s_rof = ssim(rof, u0);  m_rof = paper_mae(rof, u0);
+    p_llt = paper_psnr(llt, u0);  s_llt = ssim(llt, u0);  m_llt = paper_mae(llt, u0);
+    p_fpd = paper_psnr(fpd, u0);  s_fpd = ssim(fpd, u0);  m_fpd = paper_mae(fpd, u0);
+
+    fprintf('\n         PSNR      SSIM     MAE\n');
+    fprintf(' Noisy: %6.2f dB\n', psnr_noisy);
+    fprintf(' ROF:   %6.2f dB   %.4f   %.4f\n', p_rof, s_rof, m_rof);
+    fprintf(' LLT:   %6.2f dB   %.4f   %.4f\n', p_llt, s_llt, m_llt);
+    fprintf(' FPD:   %6.2f dB   %.4f   %.4f  <-- Proposed\n', p_fpd, s_fpd, m_fpd);
+
+    results(idx).name = fname;
+    results(idx).PSNR = [p_rof, p_llt, p_fpd];
+    results(idx).SSIM = [s_rof, s_llt, s_fpd];
+    results(idx).MAE  = [m_rof, m_llt, m_fpd];
+
+
+    figure('Name', fname, 'Position', [50 50 1300 300]);
+    subplot(1,5,1); imshow(u0);    title('Original');
+    subplot(1,5,2); imshow(noisy); title(sprintf('Noisy\n%.2fdB', psnr_noisy));
+    subplot(1,5,3); imshow(rof);   title(sprintf('ROF [5]\n%.2fdB', p_rof));
+    subplot(1,5,4); imshow(llt);   title(sprintf('LLT [6]\n%.2fdB', p_llt));
+    subplot(1,5,5); imshow(fpd);   title(sprintf('FPD (Ours)\n%.2fdB  SSIM=%.3f', p_fpd, s_fpd));
+    sgtitle(sprintf('Zhang et al. 2025 — %s | σ=%d | v*=%.2f', fname, sigma, v_opt), ...
+            'FontWeight','bold');
+end
+
+
+n_imgs    = length(results);
+names     = {results.name};
+PSNR_vals = vertcat(results.PSNR);
+SSIM_vals = vertcat(results.SSIM);
+MAE_vals  = vertcat(results.MAE);
+
+figure('Name','Metric Summary','Position',[50 420 1100 320]);
+subplot(1,3,1);
+b = bar(PSNR_vals); title('PSNR (dB) ↑ higher=better'); ylabel('dB');
+legend('ROF','LLT','FPD','Location','southeast');
+set(gca,'XTickLabel', shorten_names(names), 'XTickLabelRotation', 15);
+grid on;
+
+subplot(1,3,2);
+bar(SSIM_vals); title('SSIM ↑ higher=better');
+legend('ROF','LLT','FPD','Location','southeast');
+set(gca,'XTickLabel', shorten_names(names), 'XTickLabelRotation', 15);
+grid on;
+
+subplot(1,3,3);
+bar(MAE_vals); title('MAE ↓ lower=better');
+legend('ROF','LLT','FPD','Location','northeast');
+set(gca,'XTickLabel', shorten_names(names), 'XTickLabelRotation', 15);
+grid on;
+
+sgtitle('Comparison: ROF vs LLT vs Proposed FPD', 'FontWeight', 'bold');
+
+fprintf('\nDone. Check figures.\n');
+
+
+function u = fpd_pde(u0, ~, v, K, dt, lambda, gam, k)
+    u = u0;
+    for iter = 1:K
+       
+        Dxp = dp_x(u);  Dxm = dm_x(u);
+        Dyp = dp_y(u);  Dym = dm_y(u);
+
+        gx = sqrt(Dxp.^2 + minmod2(Dyp, Dym).^2 + 1e-10);
+        gy = sqrt(Dyp.^2 + minmod2(Dxp, Dxm).^2 + 1e-10);
+
+        uxx  = dm_x(dp_x(u));      
+        uyy  = dm_y(dp_y(u));      
+        uxyp = dp_x(dp_y(u));   
+        uyxm = dm_y(dm_x(u));       
+
+        L2 = sqrt(uxx.^2 + uxyp.^2 + uyxm.^2 + uyy.^2 + 1e-10);
+
+       
+        [Fx, Fy] = gl_frac(u, v);
+        fmag = sqrt(Fx.^2 + Fy.^2 + 1e-10);
+        g    = 1 ./ (1 + gam + k * fmag);
+
+        rof_t = dm_x((1-g).*Dxp./gx) + dm_y((1-g).*Dyp./gy);
+
+        llt_t = dm_x(dp_x( g.*uxx ./L2)) + ... 
+                dm_y(dm_x( g.*uxyp./L2)) + ...                    
+                dm_y(dp_y( g.*uyy ./L2));        
+        u = u + dt * (rof_t - llt_t - lambda*(u - u0));
+        u = max(0, min(1, u));
+    end
+end
+
+function u = rof_pde(u0, ~, K, dt, lambda)
+    u = u0;
+    for iter = 1:K
+        Dxp = dp_x(u); Dyp = dp_y(u);
+        mag = sqrt(Dxp.^2 + Dyp.^2 + 1e-10);
+        div = dm_x(Dxp./mag) + dm_y(Dyp./mag);
+        u   = u + dt*(div - lambda*(u - u0));
+        u   = max(0, min(1, u));
+    end
+end
+
+function u = llt_pde(u0, ~, K, dt, lambda)
+    u = u0;
+    for iter = 1:K
+        uxx  = dm_x(dp_x(u));
+        uyy  = dm_y(dp_y(u));
+        uxyp = dp_x(dp_y(u));
+        uyxm = dm_y(dm_x(u));
+        mag  = sqrt(uxx.^2 + uyy.^2 + uxyp.^2 + uyxm.^2 + 1e-10);
+        llt  = dm_x(dp_x(uxx./mag))  + dm_y(dp_y(uyy./mag)) + ...
+               dm_y(dm_x(uxyp./mag)) + dm_y(dm_x(uyxm./mag));
+        u    = u + dt*(-llt - lambda*(u - u0));
+        u    = max(0, min(1, u));
+    end
+end
+
+
+function v_best = fpa_optimize(u0, noisy, lambda, gam, k, dt, ...
+                               K_fit, n_pop, max_iter, p)
+
+    pop = rand(n_pop, 1) * 2;
+    fit = zeros(n_pop, 1);
+    for i = 1:n_pop
+        fit(i) = J_obj(u0, noisy, pop(i), lambda, gam, k, dt, K_fit);
+    end
+
+    [best_fit, bi] = max(fit);
+    v_best = pop(bi);
+    prev   = best_fit;
+
+    for iter = 1:max_iter
+        for i = 1:n_pop
+            if rand() < p
+                
+                L     = levy_step();
+                v_new = pop(i) + L * (pop(i) - v_best);
+            else
+               
+                m = randi(n_pop);  n = randi(n_pop);
+                v_new = pop(i) + rand() * (pop(m) - pop(n));
+            end
+            v_new = max(0, min(2, v_new));
+
+            f_new = J_obj(u0, noisy, v_new, lambda, gam, k, dt, K_fit);
+            if f_new > fit(i)
+                pop(i) = v_new;
+                fit(i) = f_new;
+            end
+        end
+
+        [cur_best, bi] = max(fit);
+        if cur_best > best_fit
+            best_fit = cur_best;
+            v_best   = pop(bi);
+        end
+
+        fprintf('   FPA %2d/%d | v*=%.4f | J=%.4f\n', ...
+                iter, max_iter, v_best, best_fit);
+        if abs(best_fit - prev) < 1e-4 && iter > 3
+            fprintf('   FPA converged at iter %d\n', iter);
+            break;
+        end
+        prev = best_fit;
+    end
+end
+
+function J = J_obj(u0, noisy, v, lambda, gam, k, dt, K)
+  
+    d = fpd_pde(noisy, u0, v, K, dt, lambda, gam, k);
+    J = paper_psnr(d, u0) + ssim(d, u0) - paper_mae(d, u0);
+end
+
+function L = levy_step()
+   
+    beta  = 1.5;
+    num   = gamma(1+beta) * sin(pi*beta/2);
+    den   = gamma((1+beta)/2) * beta * 2^((beta-1)/2);
+    sigma = (num/den)^(1/beta);
+    u_r   = randn * sigma;
+    v_r   = abs(randn) + 1e-8;
+    L     = u_r / (v_r^(1/beta));
+    L     = sign(L) * min(abs(L), 1.5); 
+end
+
+
+function [Dx, Dy] = gl_frac(u, v)
+  
+    max_k = 7;
+    w = zeros(1, max_k+1);
+    w(1) = 1;
+    for kk = 1:max_k
+        w(kk+1) = -w(kk) * (v - kk + 1) / kk;
+    end
+    w = w / (sum(abs(w)) + 1e-10); 
+
+    Dx = zeros(size(u));
+    Dy = zeros(size(u));
+    for kk = 0:max_k
+        if kk == 0
+            Dx = Dx + w(1)*u;
+            Dy = Dy + w(1)*u;
+        else
+            Dx = Dx + w(kk+1)*circshift(u, [kk  0]);
+            Dy = Dy + w(kk+1)*circshift(u, [0  kk]);
+        end
+    end
+end
+
+function out = dp_x(u)  
+    out = circshift(u,[-1 0]) - u;
+    out(end,:) = 0;
+end
+function out = dm_x(u)  
+    out = u - circshift(u,[1 0]);
+    out(1,:) = 0;
+end
+function out = dp_y(u)  
+    out = circshift(u,[0 -1]) - u;
+    out(:,end) = 0;
+end
+function out = dm_y(u)  
+    out = u - circshift(u,[0 1]);
+    out(:,1) = 0;
+end
+function out = minmod2(a, b)
+  
+    out = 0.5*(sign(a)+sign(b)) .* min(abs(a), abs(b));
+end
+
+function P = paper_psnr(img, ref)
+   
+    mse = mean((img(:) - ref(:)).^2);
+    if mse < 1e-12; P = 100; return; end
+    P = 10 * log10(1 / mse);
+end
+
+function M = paper_mae(img, ref)
+  
+    M = mean(abs(img(:) - ref(:)));
+end
+
+function s = shorten_names(names)
+   
+    s = cell(size(names));
+    for i = 1:length(names)
+        [~,n,~] = fileparts(names{i});
+        s{i} = n;
+    end
+end
